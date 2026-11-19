@@ -1,28 +1,39 @@
 package com.mycompany.bai4.util;
 
+import com.mycompany.bai4.ui.MessageReactionBar;
+
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
+import java.util.List;
+import java.util.function.BiConsumer;
 
 public class ChatBubble extends JPanel {
 
     private static final int ARC = 12;
     private static final int MAX_WIDTH = 420;
     private final boolean isSelf;
-    private int likeCount = 0;
-    private final JLabel reactionBtn;
+    private final MessageReactionBar reactionBar;
 
     public ChatBubble(String text, boolean isSelf) {
-        this(text, isSelf, "");
+        this(text, isSelf, "", -1L, "", null, "");
     }
 
     public ChatBubble(String text, boolean isSelf, String timeLabel) {
+        this(text, isSelf, timeLabel, -1L, "", null, "");
+    }
+
+    public ChatBubble(String text,
+                      boolean isSelf,
+                      String timeLabel,
+                      long messageId,
+                      String selfUsername,
+                      BiConsumer<Long, String> onReactionToggle,
+                      String initialReactions) {
         this.isSelf = isSelf;
         setOpaque(false);
-        setLayout(new BorderLayout());
-        setBorder(new EmptyBorder(1, 2, 12, 6));
+        setLayout(new BorderLayout(0, 0));
+        setBorder(new EmptyBorder(1, 2, 4, 6));
 
         JPanel bubbleBody = new JPanel(new BorderLayout(0, 4)) {
             @Override
@@ -41,26 +52,32 @@ public class ChatBubble extends JPanel {
         bubbleBody.setBorder(new EmptyBorder(10, 14, 8, 14));
 
         Font msgFont = pickEmojiCapableFont(14);
-        JTextArea textArea = new JTextArea(text);
-        textArea.setEditable(false);
-        textArea.setOpaque(false);
-        textArea.setFont(msgFont);
-        textArea.setForeground(isSelf ? ChatColor.BUBBLE_SELF_TEXT : ChatColor.BUBBLE_OTHER_TEXT);
-        textArea.setLineWrap(true);
-        textArea.setWrapStyleWord(true);
+        Color fgColor = isSelf ? ChatColor.BUBBLE_SELF_TEXT : ChatColor.BUBBLE_OTHER_TEXT;
 
-        FontMetrics fm = textArea.getFontMetrics(msgFont);
-        int maxLineW = 0;
-        for (String line : text.split("\n")) {
-            maxLineW = Math.max(maxLineW, fm.stringWidth(line));
-        }
-        if (maxLineW > MAX_WIDTH) {
-            textArea.setSize(new Dimension(MAX_WIDTH, Short.MAX_VALUE));
-            Dimension pref = textArea.getPreferredSize();
-            textArea.setPreferredSize(new Dimension(MAX_WIDTH, pref.height));
+        List<EmojiManager.TextSegment> segments = EmojiManager.tokenizeMessage(text);
+        boolean jumboMode = EmojiManager.isJumboEmojiOnly(segments);
+        int emojiPixelSize = jumboMode ? 34 : 20;
+
+        JTextPane textPane = new JTextPane();
+        textPane.setEditable(false);
+        textPane.setOpaque(false);
+        textPane.setBorder(null);
+        textPane.setMargin(new Insets(0, 0, 0, 0));
+        textPane.setFont(msgFont);
+        textPane.setForeground(fgColor);
+
+        EmojiManager.populateTextPaneWithColoredEmojis(textPane, text, msgFont, fgColor, emojiPixelSize);
+
+        Dimension naturalPref = textPane.getPreferredSize();
+        if (naturalPref.width > MAX_WIDTH) {
+            textPane.setSize(new Dimension(MAX_WIDTH, Short.MAX_VALUE));
+            Dimension wrappedPref = textPane.getPreferredSize();
+            textPane.setPreferredSize(new Dimension(MAX_WIDTH, wrappedPref.height));
+        } else {
+            textPane.setPreferredSize(new Dimension(Math.max(24, naturalPref.width + 2), naturalPref.height));
         }
 
-        bubbleBody.add(textArea, BorderLayout.CENTER);
+        bubbleBody.add(textPane, BorderLayout.CENTER);
 
         if (timeLabel != null && !timeLabel.isEmpty()) {
             JLabel timeLbl = new JLabel(timeLabel);
@@ -69,41 +86,48 @@ public class ChatBubble extends JPanel {
             bubbleBody.add(timeLbl, BorderLayout.SOUTH);
         }
 
-        reactionBtn = createReactionBadge();
-        reactionBtn.addMouseListener(new MouseAdapter() {
-            @Override
-            public void mouseClicked(MouseEvent e) {
-                likeCount++;
-                reactionBtn.setText("♥ " + likeCount);
-                reactionBtn.setForeground(new Color(0xE53935));
-                revalidate();
-                repaint();
-            }
-        });
+        reactionBar = new MessageReactionBar(messageId, isSelf, selfUsername, onReactionToggle);
+        JLabel triggerBtn = reactionBar.getTriggerButton();
 
         JLayeredPane layered = new JLayeredPane();
         Dimension bodySize = bubbleBody.getPreferredSize();
-        int w = Math.max(bodySize.width, 72);
+        int w = Math.max(bodySize.width, 74);
         int h = bodySize.height;
 
         bubbleBody.setBounds(0, 0, w, h);
-        Dimension reactSize = reactionBtn.getPreferredSize();
-        int rw = Math.max(24, reactSize.width + 8);
-        reactionBtn.setBounds(w - rw - 4, h - 10, rw, 20);
+        triggerBtn.setBounds(w - 26, h - 13, 24, 22);
 
-        layered.setPreferredSize(new Dimension(w + 4, h + 12));
+        layered.setPreferredSize(new Dimension(w + 4, h + 10));
         layered.add(bubbleBody, JLayeredPane.DEFAULT_LAYER);
-        layered.add(reactionBtn, JLayeredPane.PALETTE_LAYER);
+        layered.add(triggerBtn, JLayeredPane.PALETTE_LAYER);
 
-        add(layered, BorderLayout.CENTER);
+        reactionBar.attachHoverTargets(this, layered, bubbleBody, textPane);
+        if (initialReactions != null && !initialReactions.isEmpty()) {
+            reactionBar.updateReactionsFromSummary(initialReactions);
+        }
+
+        JPanel bubbleAlignWrap = new JPanel(new FlowLayout(isSelf ? FlowLayout.RIGHT : FlowLayout.LEFT, 0, 0));
+        bubbleAlignWrap.setOpaque(false);
+        bubbleAlignWrap.add(layered);
+
+        add(bubbleAlignWrap, BorderLayout.CENTER);
+        add(reactionBar.getPillsWrapper(), BorderLayout.SOUTH);
     }
 
-    /**
-     * Trả về Logical Composite Font (Font.SANS_SERIF) của Java:
-     * Trên Windows, Font.SANS_SERIF tự động kết hợp Segoe UI (hiển thị đầy đủ 100%
-     * tiếng Việt có dấu như 'ạ', 'ệ', 'ự', 'ể'...) và Segoe UI Emoji (hiển thị đầy đủ
-     * Emoji Unicode như 😂, ❤️, 👍) trên cả JLabel lẫn JTextArea mà không bao giờ bị lỗi ô vuông.
-     */
+    public void setMessageId(long messageId) {
+        reactionBar.setMessageId(messageId);
+    }
+
+    public long getMessageId() {
+        return reactionBar.getMessageId();
+    }
+
+    public void updateReactions(String reactionSummary) {
+        reactionBar.updateReactionsFromSummary(reactionSummary);
+        revalidate();
+        repaint();
+    }
+
     public static Font pickEmojiCapableFont(int size) {
         return new Font(Font.SANS_SERIF, Font.PLAIN, size);
     }
@@ -112,14 +136,6 @@ public class ChatBubble extends JPanel {
         return new Font(Font.SANS_SERIF, style, size);
     }
 
-    /**
-     * Chuyển đổi nội dung tin nhắn thô hoặc tên file thành nhãn xem trước chuẩn Zalo:
-     * - Hình ảnh -> [Hình ảnh]
-     * - Video -> [Video]
-     * - Âm thanh / Thoại -> [Tin nhắn thoại]
-     * - Tệp đính kèm khác -> [Tệp] <tên_tệp>
-     * - Văn bản / Emoji -> Giữ nguyên 100% tiếng Việt và Emoji, loại bỏ xuống dòng thừa.
-     */
     public static String formatPreviewContent(String rawContent) {
         if (rawContent == null || rawContent.isEmpty()) return "";
 
@@ -128,7 +144,6 @@ public class ChatBubble extends JPanel {
             String fileName = (fp.length >= 2) ? fp[1].trim() : "";
             return formatFilePreviewLabel(fileName);
         }
-        // Làm phẳng các ký tự xuống dòng trong tin nhắn nhiều dòng để hiển thị gọn trên 1 dòng preview
         return rawContent.replaceAll("[\\r\\n]+", " ").trim();
     }
 
@@ -149,10 +164,6 @@ public class ChatBubble extends JPanel {
         return "[Tệp] " + fileName;
     }
 
-    /**
-     * Cắt chuỗi an toàn theo số lượng Unicode Code Point (không cắt theo byte hay chỉ số char UTF-16),
-     * đảm bảo không bao giờ cắt đôi cặp Surrogate của Emoji (😂, ❤️, 👍) hoặc làm hỏng dấu tiếng Việt.
-     */
     public static String truncateUnicodeSafe(String text, int maxCodePoints) {
         if (text == null || text.isEmpty() || maxCodePoints <= 0) return "";
         int totalCp = text.codePointCount(0, text.length());
@@ -160,8 +171,6 @@ public class ChatBubble extends JPanel {
             return text;
         }
         int endCharIndex = text.offsetByCodePoints(0, maxCodePoints);
-        // Nếu ngay sau vị trí cắt là Variation Selector (U+FE0F) hoặc dấu tổ hợp (Combining Mark),
-        // mở rộng thêm để không làm gãy cụm ký tự hiển thị
         while (endCharIndex < text.length()) {
             int nextCp = text.codePointAt(endCharIndex);
             int type = Character.getType(nextCp);

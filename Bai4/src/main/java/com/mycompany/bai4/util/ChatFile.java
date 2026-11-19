@@ -1,5 +1,7 @@
 package com.mycompany.bai4.util;
 
+import com.mycompany.bai4.ui.MessageReactionBar;
+
 import javax.imageio.ImageIO;
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
@@ -11,28 +13,61 @@ import java.awt.geom.RoundRectangle2D;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
+import java.util.function.BiConsumer;
 
 public class ChatFile extends JPanel {
 
     private static final int ARC = 12;
     private static final int MAX_IMG_WIDTH  = 380;
     private static final int MAX_IMG_HEIGHT = 300;
-    private int likeCount = 0;
+    private final MessageReactionBar reactionBar;
 
     public ChatFile(String name, long size, File file, boolean isSelf) {
         this(name, size, file, isSelf, java.time.LocalTime.now()
-                .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm")));
+                .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm")), -1L, "", null, "");
     }
 
     public ChatFile(String name, long size, File file, boolean isSelf, String timeLabel) {
+        this(name, size, file, isSelf, timeLabel, -1L, "", null, "");
+    }
+
+    public ChatFile(String name,
+                    long size,
+                    File file,
+                    boolean isSelf,
+                    String timeLabel,
+                    long messageId,
+                    String selfUsername,
+                    BiConsumer<Long, String> onReactionToggle,
+                    String initialReactions) {
         setOpaque(false);
-        setLayout(new BorderLayout());
+        setLayout(new BorderLayout(0, 0));
+
+        this.reactionBar = new MessageReactionBar(messageId, isSelf, selfUsername, onReactionToggle);
 
         if (isImageFile(name) && file != null && file.exists()) {
             buildImagePreview(name, file, isSelf, timeLabel);
         } else {
             buildStandardFileCard(name, size, file, isSelf, timeLabel);
         }
+
+        if (initialReactions != null && !initialReactions.isEmpty()) {
+            reactionBar.updateReactionsFromSummary(initialReactions);
+        }
+    }
+
+    public void setMessageId(long messageId) {
+        reactionBar.setMessageId(messageId);
+    }
+
+    public long getMessageId() {
+        return reactionBar.getMessageId();
+    }
+
+    public void updateReactions(String reactionSummary) {
+        reactionBar.updateReactionsFromSummary(reactionSummary);
+        revalidate();
+        repaint();
     }
 
     public static boolean isImageFile(String filename) {
@@ -42,7 +77,7 @@ public class ChatFile extends JPanel {
                 || lower.endsWith(".gif") || lower.endsWith(".webp") || lower.endsWith(".bmp");
     }
 
-    // ── Chế độ 1: Hiển thị Hình ảnh trực tiếp giống Zalo Desktop (Ảnh 3) ──────
+    // ── Chế độ 1: Hiển thị Hình ảnh trực tiếp kèm Message Reactions ───────────
     private void buildImagePreview(String name, File file, boolean isSelf, String timeLabel) {
         setBorder(new EmptyBorder(2, 2, 4, 6));
         try {
@@ -69,12 +104,10 @@ public class ChatFile extends JPanel {
                     g2.setClip(clip);
                     g2.drawImage(scaledImg, 0, 0, dw, dh, this);
 
-                    // Viền mảnh quanh ảnh
                     g2.setClip(null);
                     g2.setColor(new Color(0, 0, 0, 28));
                     g2.drawRoundRect(0, 0, dw - 1, dh - 1, 12, 12);
 
-                    // Nhãn HD góc trên bên trái giống Zalo
                     g2.setColor(new Color(0, 0, 0, 130));
                     g2.fillRoundRect(8, 8, 28, 18, 6, 6);
                     g2.setColor(Color.WHITE);
@@ -94,29 +127,24 @@ public class ChatFile extends JPanel {
                 }
             });
 
-            // Nút thả cảm xúc góc dưới phải ảnh
-            JLabel reactionBtn = ChatBubble.createReactionBadge();
-            reactionBtn.addMouseListener(new MouseAdapter() {
-                @Override
-                public void mouseClicked(MouseEvent e) {
-                    likeCount++;
-                    reactionBtn.setText("♥ " + likeCount);
-                    reactionBtn.setForeground(new Color(0xE53935));
-                    revalidate();
-                    repaint();
-                }
-            });
+            JLabel triggerBtn = reactionBar.getTriggerButton();
 
             JLayeredPane layered = new JLayeredPane();
             imgCanvas.setBounds(0, 0, dw, dh);
-            reactionBtn.setBounds(dw - 32, dh - 12, 28, 20);
+            triggerBtn.setBounds(dw - 28, dh - 13, 24, 22);
             layered.setPreferredSize(new Dimension(dw + 4, dh + 10));
             layered.add(imgCanvas, JLayeredPane.DEFAULT_LAYER);
-            layered.add(reactionBtn, JLayeredPane.PALETTE_LAYER);
+            layered.add(triggerBtn, JLayeredPane.PALETTE_LAYER);
+
+            reactionBar.attachHoverTargets(this, layered, imgCanvas);
 
             add(layered, BorderLayout.CENTER);
 
-            // Viên thuốc hiển thị giờ gửi nằm bên dưới ảnh giống Zalo (Ảnh 3)
+            JPanel bottomStack = new JPanel();
+            bottomStack.setOpaque(false);
+            bottomStack.setLayout(new BoxLayout(bottomStack, BoxLayout.Y_AXIS));
+            bottomStack.add(reactionBar.getPillsWrapper());
+
             if (timeLabel != null && !timeLabel.isEmpty()) {
                 JPanel timeRow = new JPanel(new FlowLayout(isSelf ? FlowLayout.RIGHT : FlowLayout.LEFT, 2, 2));
                 timeRow.setOpaque(false);
@@ -135,15 +163,15 @@ public class ChatFile extends JPanel {
                 timePill.setForeground(Color.WHITE);
                 timePill.setBorder(new EmptyBorder(1, 8, 1, 8));
                 timeRow.add(timePill);
-                add(timeRow, BorderLayout.SOUTH);
+                bottomStack.add(timeRow);
             }
+            add(bottomStack, BorderLayout.SOUTH);
 
         } catch (IOException ex) {
             buildStandardFileCard(name, file.length(), file, isSelf, timeLabel);
         }
     }
 
-    // ── Cửa sổ xem ảnh phóng to (Image Viewer) khi click vào ảnh ──────────────
     public static void openImageViewer(String title, File file, BufferedImage image) {
         JDialog viewer = new JDialog((Frame) null, "Xem ảnh - " + title, true);
         viewer.setSize(900, 680);
@@ -151,7 +179,6 @@ public class ChatFile extends JPanel {
         viewer.setLayout(new BorderLayout());
         viewer.getContentPane().setBackground(new Color(0x18191A));
 
-        // Thanh công cụ trên cùng
         JPanel topBar = new JPanel(new BorderLayout());
         topBar.setBackground(new Color(0x242526));
         topBar.setBorder(new EmptyBorder(10, 16, 10, 16));
@@ -180,7 +207,6 @@ public class ChatFile extends JPanel {
         topBar.add(titleLbl, BorderLayout.WEST);
         topBar.add(btnGroup, BorderLayout.EAST);
 
-        // Khu vực vẽ ảnh tự co giãn vừa cửa sổ giữ nguyên tỷ lệ
         JPanel canvas = new JPanel() {
             @Override
             protected void paintComponent(Graphics g) {
@@ -213,7 +239,7 @@ public class ChatFile extends JPanel {
 
     // ── Chế độ 2: Thẻ File đính kèm (DOCX, PDF, ZIP, XLSX...) ─────────────────
     private void buildStandardFileCard(String name, long size, File file, boolean isSelf, String timeLabel) {
-        setBorder(new EmptyBorder(2, 2, 12, 6));
+        setBorder(new EmptyBorder(2, 2, 4, 6));
 
         JPanel cardBody = new JPanel(new BorderLayout(12, 6)) {
             @Override
@@ -269,7 +295,6 @@ public class ChatFile extends JPanel {
             infoPanel.add(timeLbl);
         }
 
-        // Hai nút vuông vẽ bằng Graphics2D (Mở thư mục & Mở/Tải file) không lỗi ô vuông
         JPanel actionBtns = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 8));
         actionBtns.setOpaque(false);
 
@@ -297,28 +322,21 @@ public class ChatFile extends JPanel {
         cardBody.add(infoPanel,  BorderLayout.CENTER);
         cardBody.add(actionBtns, BorderLayout.EAST);
 
-        JLabel reactionBtn = ChatBubble.createReactionBadge();
-        reactionBtn.addMouseListener(new MouseAdapter() {
-            @Override
-            public void mouseClicked(MouseEvent e) {
-                likeCount++;
-                reactionBtn.setText("♥ " + likeCount);
-                reactionBtn.setForeground(new Color(0xE53935));
-                revalidate();
-                repaint();
-            }
-        });
+        JLabel triggerBtn = reactionBar.getTriggerButton();
 
         JLayeredPane layered = new JLayeredPane();
         int w = 345, h = 84;
         cardBody.setBounds(0, 0, w, h);
-        reactionBtn.setBounds(w - 32, h - 10, 28, 20);
+        triggerBtn.setBounds(w - 28, h - 12, 24, 22);
 
-        layered.setPreferredSize(new Dimension(w + 4, h + 12));
+        layered.setPreferredSize(new Dimension(w + 4, h + 10));
         layered.add(cardBody, JLayeredPane.DEFAULT_LAYER);
-        layered.add(reactionBtn, JLayeredPane.PALETTE_LAYER);
+        layered.add(triggerBtn, JLayeredPane.PALETTE_LAYER);
+
+        reactionBar.attachHoverTargets(this, layered, cardBody, infoPanel);
 
         add(layered, BorderLayout.CENTER);
+        add(reactionBar.getPillsWrapper(), BorderLayout.SOUTH);
     }
 
     private JButton createVectorActionButton(boolean isFolder, String tooltip) {

@@ -17,7 +17,6 @@ public class ChatServer {
     private final UserStore userStore = new UserStore();
     private final ConcurrentHashMap<String, ClientHandler> clients = new ConcurrentHashMap<>();
 
-    // Quản lý các phiên cuộc gọi đang hoạt động theo callId và theo username
     private final ConcurrentHashMap<Long, CallSession> activeCalls = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Long> userCallMap      = new ConcurrentHashMap<>();
 
@@ -184,20 +183,24 @@ public class ChatServer {
             if (line.startsWith("MSG:")) {
                 String[] p = line.split(":", 3);
                 if (p.length == 3) {
-                    String text        = p[2];
-                    String forwardLine = "MSG:" + username + ":" + displayName + ":" + text;
-                    MessageStore.saveGroupMessage(username, displayName, text);
+                    String text  = p[2];
+                    long msgId   = MessageStore.saveGroupMessage(username, displayName, text);
+                    sendLine("MSG_ACK:GROUP:" + msgId);
+                    String forwardLine = "MSG_ID:" + msgId + ":" + username + ":" + displayName + ":" + text;
                     broadcast(forwardLine, username);
                 }
             } else if (line.startsWith("PM:")) {
                 String[] p = line.split(":", 4);
                 if (p.length == 4) {
-                    String toUser      = p[2];
-                    String text        = p[3];
-                    String forwardLine = "PM:" + username + ":" + displayName + ":" + text;
-                    MessageStore.savePrivateMessage(username, displayName, toUser, text);
+                    String toUser = p[2];
+                    String text   = p[3];
+                    long msgId    = MessageStore.savePrivateMessage(username, displayName, toUser, text);
+                    sendLine("MSG_ACK:" + toUser + ":" + msgId);
+                    String forwardLine = "PM_ID:" + msgId + ":" + username + ":" + displayName + ":" + text;
                     sendTo(toUser, forwardLine);
                 }
+            } else if (line.startsWith("REACT:")) {
+                handleReactionCommand(line);
             } else if (line.equals("GET_HISTORY")) {
                 sendGroupHistory();
                 sendLatestPrivatePreviews();
@@ -208,6 +211,38 @@ public class ChatServer {
                 routeFilePacket(line);
             } else if (line.startsWith("CALL_")) {
                 handleCallSignaling(line);
+            }
+        }
+
+        private void handleReactionCommand(String line) {
+            String[] p = line.split(":", 3);
+            if (p.length < 3) return;
+            long msgId;
+            try {
+                msgId = Long.parseLong(p[1].trim());
+            } catch (NumberFormatException e) {
+                return;
+            }
+            String emoji = p[2].trim();
+            if (msgId <= 0 || emoji.isEmpty()) return;
+
+            Message targetMsg = MessageStore.findMessageById(msgId);
+            if (targetMsg == null) return;
+
+            String updatedSummary = MessageStore.toggleReaction(msgId, username, emoji);
+
+            if ("group".equalsIgnoreCase(targetMsg.type())) {
+                String packet = "REACTION_UPDATE:GROUP:" + msgId + ":" + updatedSummary;
+                broadcast(packet, null);
+            } else {
+                String u1 = targetMsg.fromUser();
+                String u2 = targetMsg.toUser();
+                if (u1 != null && u2 != null) {
+                    sendTo(u1, "REACTION_UPDATE:" + u2 + ":" + msgId + ":" + updatedSummary);
+                    if (!u2.equals(u1)) {
+                        sendTo(u2, "REACTION_UPDATE:" + u1 + ":" + msgId + ":" + updatedSummary);
+                    }
+                }
             }
         }
 
@@ -314,16 +349,12 @@ public class ChatServer {
             if (history.isEmpty()) return;
             sendLine("HISTORY_START:GROUP");
             for (Message msg : history) {
-                sendLine("HISTORY_MSG:GROUP:" + msg.fromUser() + ":" + msg.fromDisplay()
-                        + ":" + msg.sentAt() + ":" + msg.content());
+                sendLine("HISTORY_MSG_V2:GROUP:" + msg.id() + ":" + msg.fromUser() + ":"
+                        + msg.fromDisplay() + ":" + msg.sentAt() + ":" + msg.reactions() + ":" + msg.content());
             }
             sendLine("HISTORY_END:GROUP");
         }
 
-        /**
-         * Gửi thông tin xem trước tin nhắn gần nhất của từng cuộc trò chuyện riêng
-         * để cột bên trái hiển thị đầy đủ ngay khi mở ứng dụng mà không cần truyền toàn bộ Base64.
-         */
         private void sendLatestPrivatePreviews() {
             List<Message> latestList = MessageStore.loadLatestPrivateMessagesForUser(username);
             for (Message msg : latestList) {
@@ -331,7 +362,6 @@ public class ChatServer {
                 if (otherUser == null || otherUser.isEmpty()) continue;
 
                 String previewContent = msg.content();
-                // Nếu là dữ liệu file nhị phân, chỉ gửi tên file để tạo nhãn xem trước, không gửi chuỗi Base64
                 if (previewContent != null && previewContent.startsWith("[FILE_DATA]:")) {
                     String[] fp = previewContent.split(":", 3);
                     if (fp.length >= 2) {
@@ -348,8 +378,8 @@ public class ChatServer {
             if (history.isEmpty()) return;
             sendLine("HISTORY_START:" + otherUser);
             for (Message msg : history) {
-                sendLine("HISTORY_MSG:" + otherUser + ":" + msg.fromUser() + ":" + msg.fromDisplay()
-                        + ":" + msg.sentAt() + ":" + msg.content());
+                sendLine("HISTORY_MSG_V2:" + otherUser + ":" + msg.id() + ":" + msg.fromUser() + ":"
+                        + msg.fromDisplay() + ":" + msg.sentAt() + ":" + msg.reactions() + ":" + msg.content());
             }
             sendLine("HISTORY_END:" + otherUser);
         }
@@ -363,11 +393,19 @@ public class ChatServer {
                 String fileName = parts[3];
                 String b64Data  = parts[4];
                 String dbContent = "[FILE_DATA]:" + fileName + ":" + b64Data;
+                long msgId;
                 if ("ALL".equalsIgnoreCase(to)) {
-                    MessageStore.saveGroupMessage(username, displayName, dbContent);
+                    msgId = MessageStore.saveGroupMessage(username, displayName, dbContent);
+                    sendLine("MSG_ACK:GROUP:" + msgId);
+                    String forward = "FILE_DATA_ID:" + msgId + ":" + username + ":" + to + ":" + fileName + ":" + b64Data;
+                    broadcast(forward, username);
                 } else {
-                    MessageStore.savePrivateMessage(username, displayName, to, dbContent);
+                    msgId = MessageStore.savePrivateMessage(username, displayName, to, dbContent);
+                    sendLine("MSG_ACK:" + to + ":" + msgId);
+                    String forward = "FILE_DATA_ID:" + msgId + ":" + username + ":" + to + ":" + fileName + ":" + b64Data;
+                    sendTo(to, forward);
                 }
+                return;
             }
 
             if ("ALL".equalsIgnoreCase(to)) broadcast(line, username);

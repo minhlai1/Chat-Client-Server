@@ -14,9 +14,12 @@ import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.filechooser.FileSystemView;
 import java.awt.*;
 import java.awt.event.*;
+import java.awt.geom.GeneralPath;
 import java.awt.image.BufferedImage;
 import java.io.File;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -33,13 +36,18 @@ public class ChatUI extends JFrame {
     private final String selfDisplayName;
     private final String serverHost;
 
-    private final Map<String, MessageFeedPanel> conversationFeeds = new LinkedHashMap<>();
-    private final Map<String, String>           lastSenderPerConv = new HashMap<>();
-    private final Map<String, Integer>          unreadCounts      = new HashMap<>();
-    private final Map<String, String>           lastDatePerConv   = new HashMap<>();
-    private final Map<String, String>           lastMsgPreview    = new HashMap<>();
-    private final Map<String, String>           lastMsgTime       = new HashMap<>();
-    private final Map<String, List<FileEntry>>  sharedFilesMap    = new HashMap<>();
+    private final Map<String, MessageFeedPanel> conversationFeeds   = new LinkedHashMap<>();
+    private final Map<String, String>           lastSenderPerConv   = new HashMap<>();
+    private final Map<String, Integer>          unreadCounts        = new HashMap<>();
+    private final Map<String, String>           lastDatePerConv     = new HashMap<>();
+    private final Map<String, String>           lastMsgPreview      = new HashMap<>();
+    private final Map<String, String>           lastMsgTime         = new HashMap<>();
+    private final Map<String, List<FileEntry>>  sharedFilesMap      = new HashMap<>();
+
+    // Quản lý tham chiếu Message ID để đồng bộ Reaction theo thời gian thực
+    private final Map<Long, JComponent>         messageComponentMap = new HashMap<>();
+    private final Map<Long, JPanel>             messageRowMap       = new HashMap<>();
+    private final Map<String, Deque<JComponent>> pendingSelfMessages = new HashMap<>();
 
     private String activeConversation = GROUP_ID;
     private String activeLabel        = GROUP_LABEL;
@@ -48,19 +56,20 @@ public class ChatUI extends JFrame {
     private List<String[]> cachedUsers = new ArrayList<>();
 
     // UI refs
-    private JScrollPane chatScroll;
-    private JTextField  inputField;
-    private JButton     sendOrLikeBtn;
-    private JLabel      chatTitleLbl;
-    private JLabel      chatStatusLbl;
-    private AvatarLabel headerAvatar;
-    private JPanel      rightInfoPanel;
-    private AvatarLabel infoAvatar;
-    private JLabel      infoNameLbl;
-    private JPanel      infoFileListPanel;
-    private JPanel      infoMediaGridPanel;
+    private JScrollPane      chatScroll;
+    private JTextField       inputField;
+    private JButton          sendOrLikeBtn;
+    private JLabel           chatTitleLbl;
+    private JLabel           chatStatusLbl;
+    private AvatarLabel      headerAvatar;
+    private JPanel           rightInfoPanel;
+    private AvatarLabel      infoAvatar;
+    private JLabel           infoNameLbl;
+    private JPanel           infoFileListPanel;
+    private JPanel           infoMediaGridPanel;
     private DefaultListModel<ConvItem> convListModel;
     private JList<ConvItem>            convList;
+    private EmojiPickerPopup           emojiPickerPopup;
 
     private record FileEntry(String name, long size, File file, String time) {}
 
@@ -173,94 +182,315 @@ public class ChatUI extends JFrame {
         }
     }
 
+    /**
+     * Hệ thống Vector Icon chuẩn Fluent UI / Tabler Duotone (vẽ 100% bằng Graphics2D,
+     * sắc nét trên mọi độ phân giải, có lớp màu nền duotone + nét chính sắc sảo).
+     */
     private static class ZaloVectorIcon implements Icon {
-        enum Type { SMILE, IMAGE, ATTACH, CARD, CUT, FORMAT, MORE, CALL, VIDEO, SEARCH, PANEL_SPLIT, SEND_LIKE }
+        enum Type {
+            // Left NavBar
+            NAV_MESSAGE, NAV_CONTACTS, NAV_TASKS, NAV_CLOUD, NAV_SETTINGS,
+            // Header & Input Toolbar
+            SMILE, IMAGE, ATTACH, CARD, CUT, FORMAT, MORE,
+            CALL, VIDEO, SEARCH, PANEL_SPLIT, SEND_LIKE,
+            // Right Info Panel
+            BELL, PIN, GROUP_ADD, REMINDER, MEDIA_GALLERY, FILE_FOLDER
+        }
+
         private final Type type;
         private final int size;
         private final Color color;
+        private final boolean hovered;
 
         ZaloVectorIcon(Type type, int size, Color color) {
+            this(type, size, color, false);
+        }
+
+        ZaloVectorIcon(Type type, int size, Color color, boolean hovered) {
             this.type = type;
             this.size = size;
             this.color = color;
+            this.hovered = hovered;
         }
 
         @Override public int getIconWidth() { return size; }
         @Override public int getIconHeight() { return size; }
 
+        private Color withAlpha(Color c, int alpha) {
+            return new Color(c.getRed(), c.getGreen(), c.getBlue(), Math.max(0, Math.min(255, alpha)));
+        }
+
+        private Color darken(Color c, float factor) {
+            int r = Math.max(0, (int) (c.getRed() * (1f - factor)));
+            int g = Math.max(0, (int) (c.getGreen() * (1f - factor)));
+            int b = Math.max(0, (int) (c.getBlue() * (1f - factor)));
+            return new Color(r, g, b, c.getAlpha());
+        }
+
         @Override
         public void paintIcon(Component c, Graphics g, int x, int y) {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setRenderingHint(RenderingHints.KEY_STROKE_CONTROL, RenderingHints.VALUE_STROKE_PURE);
             g2.translate(x, y);
-            g2.setColor(color);
-            g2.setStroke(new BasicStroke(1.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+
+            Color strokeCol = hovered ? darken(color, 0.12f) : color;
+            Color softFill  = withAlpha(strokeCol, hovered ? 58 : 34);
+            g2.setStroke(new BasicStroke(1.65f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
 
             switch (type) {
+                // ── 1. Thanh điều hướng bên trái (NavBar Icons) ──
+                case NAV_MESSAGE -> {
+                    g2.setColor(withAlpha(strokeCol, hovered ? 75 : 42));
+                    g2.fillRoundRect(2, 3, size - 4, size - 7, 8, 8);
+                    g2.setColor(strokeCol);
+                    g2.drawRoundRect(2, 3, size - 4, size - 7, 8, 8);
+                    int[] px = {6, 10, 6};
+                    int[] py = {size - 4, size - 4, size - 1};
+                    g2.fillPolygon(px, py, 3);
+                    g2.drawLine(6, 8, size - 6, 8);
+                    g2.drawLine(6, 12, size - 9, 12);
+                }
+                case NAV_CONTACTS -> {
+                    g2.setColor(withAlpha(strokeCol, hovered ? 75 : 42));
+                    g2.fillRoundRect(4, 2, size - 7, size - 4, 5, 5);
+                    g2.setColor(strokeCol);
+                    g2.drawRoundRect(4, 2, size - 7, size - 4, 5, 5);
+                    g2.drawLine(2, 6, 4, 6);
+                    g2.drawLine(2, 11, 4, 11);
+                    g2.drawLine(2, 16, 4, 16);
+                    g2.fillOval(9, 6, 4, 4);
+                    g2.drawArc(7, 11, 8, 6, 0, 180);
+                }
+                case NAV_TASKS -> {
+                    g2.setColor(withAlpha(strokeCol, hovered ? 75 : 42));
+                    g2.fillRoundRect(3, 3, size - 6, size - 6, 6, 6);
+                    g2.setColor(strokeCol);
+                    g2.drawRoundRect(3, 3, size - 6, size - 6, 6, 6);
+                    g2.setStroke(new BasicStroke(2.0f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                    g2.drawLine(7, size / 2 + 1, 10, size / 2 + 4);
+                    g2.drawLine(10, size / 2 + 4, size - 6, 8);
+                }
+                case NAV_CLOUD -> {
+                    GeneralPath cloud = new GeneralPath();
+                    cloud.moveTo(6, size - 5);
+                    cloud.lineTo(size - 5, size - 5);
+                    cloud.curveTo(size - 2, size - 5, size - 2, size - 11, size - 5, size - 11);
+                    cloud.curveTo(size - 5, 5, 9, 4, 8, 9);
+                    cloud.curveTo(3, 9, 3, size - 5, 6, size - 5);
+                    cloud.closePath();
+                    g2.setColor(withAlpha(strokeCol, hovered ? 75 : 42));
+                    g2.fill(cloud);
+                    g2.setColor(strokeCol);
+                    g2.draw(cloud);
+                }
+                case NAV_SETTINGS -> {
+                    int cx = size / 2;
+                    int cy = size / 2;
+                    g2.setColor(withAlpha(strokeCol, hovered ? 75 : 42));
+                    g2.fillOval(cx - 6, cy - 6, 12, 12);
+                    g2.setColor(strokeCol);
+                    g2.drawOval(cx - 6, cy - 6, 12, 12);
+                    g2.fillOval(cx - 2, cy - 2, 4, 4);
+                    for (int i = 0; i < 8; i++) {
+                        double a = Math.toRadians(i * 45);
+                        int x1 = cx + (int) Math.round(Math.cos(a) * 6);
+                        int y1 = cy + (int) Math.round(Math.sin(a) * 6);
+                        int x2 = cx + (int) Math.round(Math.cos(a) * 8.5);
+                        int y2 = cy + (int) Math.round(Math.sin(a) * 8.5);
+                        g2.drawLine(x1, y1, x2, y2);
+                    }
+                }
+
+                // ── 2. Thanh công cụ nhập tin nhắn (Input Toolbar Icons) ──
                 case SMILE -> {
+                    g2.setColor(withAlpha(ChatColor.ICON_EMOJI, hovered ? 75 : 45));
+                    g2.fillOval(2, 2, size - 4, size - 4);
+                    g2.setColor(strokeCol);
                     g2.drawOval(2, 2, size - 4, size - 4);
                     g2.fillOval(6, 7, 2, 2);
                     g2.fillOval(size - 8, 7, 2, 2);
                     g2.drawArc(6, 7, size - 12, size - 11, 200, 140);
                 }
                 case IMAGE -> {
-                    g2.drawRoundRect(2, 3, size - 4, size - 6, 3, 3);
+                    g2.setColor(softFill);
+                    g2.fillRoundRect(2, 3, size - 4, size - 6, 5, 5);
+                    g2.setColor(strokeCol);
+                    g2.drawRoundRect(2, 3, size - 4, size - 6, 5, 5);
+                    g2.setColor(ChatColor.ICON_EMOJI);
                     g2.fillOval(5, 6, 3, 3);
+                    g2.setColor(strokeCol);
                     int[] px = {3, 8, 12, size - 3};
                     int[] py = {size - 4, 10, 13, 8};
                     g2.drawPolyline(px, py, 4);
                 }
                 case ATTACH -> {
-                    g2.drawArc(5, 2, 8, 8, 0, 180);
-                    g2.drawLine(5, 6, 5, size - 5);
-                    g2.drawArc(5, size - 9, 6, 6, 180, 180);
-                    g2.drawLine(11, size - 6, 11, 6);
+                    g2.setColor(softFill);
+                    g2.fillRoundRect(3, 2, size - 6, size - 4, 6, 6);
+                    g2.setColor(strokeCol);
+                    g2.drawArc(6, 3, 7, 7, 0, 180);
+                    g2.drawLine(6, 6, 6, size - 6);
+                    g2.drawArc(6, size - 9, 5, 5, 180, 180);
+                    g2.drawLine(11, size - 6, 11, 7);
                 }
                 case CARD -> {
-                    g2.drawRoundRect(2, 4, size - 4, size - 8, 3, 3);
-                    g2.drawOval(5, 7, 4, 4);
+                    g2.setColor(softFill);
+                    g2.fillRoundRect(2, 4, size - 4, size - 8, 5, 5);
+                    g2.setColor(strokeCol);
+                    g2.drawRoundRect(2, 4, size - 4, size - 8, 5, 5);
+                    g2.fillOval(5, 7, 4, 4);
                     g2.drawLine(11, 8, size - 5, 8);
-                    g2.drawLine(11, 11, size - 5, 11);
+                    g2.drawLine(11, 12, size - 6, 12);
                 }
                 case CUT -> {
-                    g2.drawOval(3, size - 8, 5, 5);
-                    g2.drawOval(size - 8, size - 8, 5, 5);
+                    g2.setColor(softFill);
+                    g2.fillOval(2, size - 9, 6, 6);
+                    g2.fillOval(size - 8, size - 9, 6, 6);
+                    g2.setColor(strokeCol);
+                    g2.drawOval(2, size - 9, 6, 6);
+                    g2.drawOval(size - 8, size - 9, 6, 6);
                     g2.drawLine(7, size - 5, size - 4, 3);
                     g2.drawLine(size - 7, size - 5, 4, 3);
                 }
                 case FORMAT -> {
-                    g2.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 13));
-                    g2.drawString("A/", 2, size - 4);
+                    g2.setColor(softFill);
+                    g2.fillRoundRect(2, 3, size - 4, size - 6, 5, 5);
+                    g2.setColor(strokeCol);
+                    g2.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 12));
+                    g2.drawString("A", 3, size - 5);
+                    g2.setColor(ChatColor.ICON_CUT);
+                    g2.drawLine(12, size - 5, 16, 6);
                 }
                 case MORE -> {
-                    g2.fillOval(3, size / 2 - 1, 3, 3);
+                    g2.setColor(softFill);
+                    g2.fillRoundRect(2, 4, size - 4, size - 8, 6, 6);
+                    g2.setColor(strokeCol);
+                    g2.fillOval(4, size / 2 - 1, 3, 3);
                     g2.fillOval(size / 2 - 1, size / 2 - 1, 3, 3);
-                    g2.fillOval(size - 6, size / 2 - 1, 3, 3);
+                    g2.fillOval(size - 7, size / 2 - 1, 3, 3);
                 }
+
+                // ── 3. Thanh công cụ phía trên khung chat (Header Icons) ──
                 case CALL -> {
-                    g2.drawRoundRect(4, 3, size - 8, size - 6, 6, 6);
-                    g2.drawLine(7, size - 6, size - 7, size - 6);
+                    GeneralPath phone = new GeneralPath();
+                    phone.moveTo(5, 4);
+                    phone.quadTo(3, 4, 3, 7);
+                    phone.quadTo(3, 15, 11, 15);
+                    phone.quadTo(14, 15, 14, 13);
+                    phone.lineTo(12, 11);
+                    phone.lineTo(10, 12);
+                    phone.quadTo(6, 11, 6, 8);
+                    phone.lineTo(7, 6);
+                    phone.closePath();
+                    g2.setColor(softFill);
+                    g2.fill(phone);
+                    g2.setColor(strokeCol);
+                    g2.draw(phone);
+                    g2.drawArc(9, 3, 6, 6, 0, 90);
                 }
                 case VIDEO -> {
-                    g2.drawRoundRect(2, 5, size - 8, size - 10, 3, 3);
+                    g2.setColor(softFill);
+                    g2.fillRoundRect(2, 5, size - 8, size - 10, 4, 4);
                     int[] vx = {size - 6, size - 2, size - 2, size - 6};
                     int[] vy = {8, 5, size - 5, size - 8};
+                    g2.fillPolygon(vx, vy, 4);
+                    g2.setColor(strokeCol);
+                    g2.drawRoundRect(2, 5, size - 8, size - 10, 4, 4);
                     g2.drawPolygon(vx, vy, 4);
                 }
                 case SEARCH -> {
+                    g2.setColor(softFill);
+                    g2.fillOval(3, 3, size - 8, size - 8);
+                    g2.setColor(strokeCol);
                     g2.drawOval(3, 3, size - 8, size - 8);
+                    g2.setStroke(new BasicStroke(2.0f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
                     g2.drawLine(size - 6, size - 6, size - 2, size - 2);
                 }
                 case PANEL_SPLIT -> {
-                    g2.drawRoundRect(2, 3, size - 4, size - 6, 3, 3);
-                    g2.fillRect(size - 8, 4, 5, size - 8);
+                    g2.setColor(softFill);
+                    g2.fillRoundRect(2, 3, size - 4, size - 6, 4, 4);
+                    g2.setColor(strokeCol);
+                    g2.drawRoundRect(2, 3, size - 4, size - 6, 4, 4);
+                    g2.setColor(withAlpha(strokeCol, 190));
+                    g2.fillRoundRect(size - 8, 4, 5, size - 8, 2, 2);
                 }
                 case SEND_LIKE -> {
-                    g2.setColor(new Color(0xF59E0B));
-                    g2.fillRoundRect(3, 8, 4, 8, 2, 2);
-                    int[] tx = {7, 10, 12, 12, 16, 15, 7};
-                    int[] ty = {8, 3, 3, 7, 7, 16, 16};
+                    Color gold = hovered ? darken(ChatColor.ICON_EMOJI, 0.1f) : ChatColor.ICON_EMOJI;
+                    g2.setColor(withAlpha(gold, 65));
+                    int[] tx = {7, 10, 12, 12, 17, 16, 7};
+                    int[] ty = {8, 2, 2, 7, 7, 16, 16};
                     g2.fillPolygon(tx, ty, 7);
+                    g2.setColor(gold);
+                    g2.fillRoundRect(2, 8, 4, 8, 2, 2);
+                    g2.drawPolygon(tx, ty, 7);
+                }
+
+                // ── 4. Bảng thông tin hội thoại bên phải (Right Info Panel Icons) ──
+                case BELL -> {
+                    g2.setColor(softFill);
+                    g2.fillArc(4, 3, size - 8, size - 6, 0, 180);
+                    g2.fillRect(4, size / 2, size - 8, 4);
+                    g2.setColor(strokeCol);
+                    g2.drawArc(4, 3, size - 8, size - 6, 0, 180);
+                    g2.drawLine(4, size / 2, 4, size - 5);
+                    g2.drawLine(size - 4, size / 2, size - 4, size - 5);
+                    g2.drawLine(2, size - 5, size - 2, size - 5);
+                    g2.fillArc(size / 2 - 2, size - 5, 4, 4, 180, 180);
+                }
+                case PIN -> {
+                    g2.setColor(softFill);
+                    g2.fillRoundRect(5, 3, size - 10, 7, 3, 3);
+                    g2.setColor(strokeCol);
+                    g2.drawRoundRect(5, 3, size - 10, 7, 3, 3);
+                    g2.drawLine(4, 10, size - 4, 10);
+                    g2.setStroke(new BasicStroke(2.0f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                    g2.drawLine(size / 2, 10, size / 2, size - 2);
+                }
+                case GROUP_ADD -> {
+                    g2.setColor(softFill);
+                    g2.fillOval(4, 3, 6, 6);
+                    g2.fillArc(2, 10, 10, 7, 0, 180);
+                    g2.setColor(strokeCol);
+                    g2.drawOval(4, 3, 6, 6);
+                    g2.drawArc(2, 10, 10, 7, 0, 180);
+                    g2.setColor(ChatColor.ICON_CALL);
+                    g2.setStroke(new BasicStroke(1.8f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                    g2.drawLine(size - 6, 6, size - 2, 6);
+                    g2.drawLine(size - 4, 4, size - 4, 8);
+                }
+                case REMINDER -> {
+                    g2.setColor(softFill);
+                    g2.fillOval(2, 2, size - 4, size - 4);
+                    g2.setColor(strokeCol);
+                    g2.drawOval(2, 2, size - 4, size - 4);
+                    g2.drawLine(size / 2, 5, size / 2, size / 2);
+                    g2.drawLine(size / 2, size / 2, size - 5, size / 2 + 2);
+                }
+                case MEDIA_GALLERY -> {
+                    g2.setColor(softFill);
+                    g2.fillRoundRect(2, 3, size - 4, size - 6, 4, 4);
+                    g2.setColor(strokeCol);
+                    g2.drawRoundRect(2, 3, size - 4, size - 6, 4, 4);
+                    g2.setColor(ChatColor.ICON_EMOJI);
+                    g2.fillOval(5, 6, 3, 3);
+                    g2.setColor(strokeCol);
+                    int[] px = {3, 7, 11, size - 3};
+                    int[] py = {size - 4, 9, 12, 7};
+                    g2.drawPolyline(px, py, 4);
+                }
+                case FILE_FOLDER -> {
+                    GeneralPath folder = new GeneralPath();
+                    folder.moveTo(2, 5);
+                    folder.lineTo(7, 5);
+                    folder.lineTo(9, 7);
+                    folder.lineTo(size - 2, 7);
+                    folder.lineTo(size - 2, size - 3);
+                    folder.lineTo(2, size - 3);
+                    folder.closePath();
+                    g2.setColor(softFill);
+                    g2.fill(folder);
+                    g2.setColor(strokeCol);
+                    g2.draw(folder);
                 }
             }
             g2.dispose();
@@ -326,24 +556,27 @@ public class ChatUI extends JFrame {
 
         nav.add(avatarWrap);
         nav.add(Box.createVerticalStrut(10));
-        nav.add(navIcon("💬", "Tin nhắn", true));
-        nav.add(navIcon("📇", "Danh bạ", false));
-        nav.add(navIcon("☑", "Công việc", false));
+        nav.add(navIcon(ZaloVectorIcon.Type.NAV_MESSAGE,  new Color(0xFFFFFF), "Tin nhắn", true));
+        nav.add(navIcon(ZaloVectorIcon.Type.NAV_CONTACTS, new Color(0x7CE7DF), "Danh bạ", false));
+        nav.add(navIcon(ZaloVectorIcon.Type.NAV_TASKS,    new Color(0xA7F3D0), "Công việc", false));
         nav.add(Box.createVerticalGlue());
-        nav.add(navIcon("☁", "Cloud của tôi", false));
-        nav.add(navIcon("⚙", "Cài đặt (" + serverHost + ")", false));
+        nav.add(navIcon(ZaloVectorIcon.Type.NAV_CLOUD,    new Color(0xBAE6FD), "Cloud của tôi", false));
+        nav.add(navIcon(ZaloVectorIcon.Type.NAV_SETTINGS, new Color(0xFDE68A), "Cài đặt (" + serverHost + ")", false));
 
         return nav;
     }
 
-    private JPanel navIcon(String symbol, String tooltip, boolean active) {
+    private JPanel navIcon(ZaloVectorIcon.Type iconType, Color tintColor, String tooltip, boolean active) {
+        final boolean[] hovered = {false};
+        JLabel lbl = new JLabel(new ZaloVectorIcon(iconType, 22, active ? Color.WHITE : tintColor, false), SwingConstants.CENTER);
+
         JPanel wrap = new JPanel(new BorderLayout()) {
             @Override protected void paintComponent(Graphics g) {
-                if (active) {
+                if (active || hovered[0]) {
                     Graphics2D g2 = (Graphics2D) g.create();
                     g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                    g2.setColor(new Color(0x0052CC));
-                    g2.fillRoundRect(8, 4, getWidth() - 16, getHeight() - 8, 10, 10);
+                    g2.setColor(active ? new Color(0x0052CC) : new Color(255, 255, 255, 38));
+                    g2.fillRoundRect(10, 4, getWidth() - 20, getHeight() - 8, 12, 12);
                     g2.dispose();
                 }
                 super.paintComponent(g);
@@ -354,11 +587,20 @@ public class ChatUI extends JFrame {
         wrap.setMaximumSize(new Dimension(64, 52));
         wrap.setPreferredSize(new Dimension(64, 52));
         wrap.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-
-        JLabel lbl = new JLabel(symbol, SwingConstants.CENTER);
-        lbl.setFont(ChatBubble.pickEmojiCapableFont(20));
-        lbl.setForeground(active ? ChatColor.NAV_ICON_ACT : ChatColor.NAV_ICON);
         wrap.add(lbl, BorderLayout.CENTER);
+
+        wrap.addMouseListener(new MouseAdapter() {
+            @Override public void mouseEntered(MouseEvent e) {
+                hovered[0] = true;
+                lbl.setIcon(new ZaloVectorIcon(iconType, 22, Color.WHITE, true));
+                wrap.repaint();
+            }
+            @Override public void mouseExited(MouseEvent e) {
+                hovered[0] = false;
+                lbl.setIcon(new ZaloVectorIcon(iconType, 22, active ? Color.WHITE : tintColor, false));
+                wrap.repaint();
+            }
+        });
         return wrap;
     }
 
@@ -388,7 +630,7 @@ public class ChatUI extends JFrame {
         searchWrap.setOpaque(false);
         searchWrap.setBorder(new EmptyBorder(6, 10, 6, 10));
 
-        JLabel searchIcon = new JLabel(new ZaloVectorIcon(ZaloVectorIcon.Type.SEARCH, 15, ChatColor.TEXT_SUB));
+        JLabel searchIcon = new JLabel(new ZaloVectorIcon(ZaloVectorIcon.Type.SEARCH, 16, ChatColor.ICON_MSG));
 
         JTextField searchField = new JTextField() {
             @Override protected void paintComponent(Graphics g) {
@@ -628,10 +870,10 @@ public class ChatUI extends JFrame {
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 4));
         actions.setOpaque(false);
 
-        JButton callBtn       = createHeaderVectorButton(ZaloVectorIcon.Type.CALL, "Cuộc gọi thoại", false);
-        JButton videoBtn      = createHeaderVectorButton(ZaloVectorIcon.Type.VIDEO, "Cuộc gọi video", false);
-        JButton searchBtn     = createHeaderVectorButton(ZaloVectorIcon.Type.SEARCH, "Tìm kiếm tin nhắn", false);
-        JButton toggleInfoBtn = createHeaderVectorButton(ZaloVectorIcon.Type.PANEL_SPLIT, "Thông tin hội thoại", true);
+        JButton callBtn       = createHeaderVectorButton(ZaloVectorIcon.Type.CALL,        ChatColor.ICON_CALL,    "Cuộc gọi thoại", false);
+        JButton videoBtn      = createHeaderVectorButton(ZaloVectorIcon.Type.VIDEO,       ChatColor.ICON_VIDEO,   "Cuộc gọi video", false);
+        JButton searchBtn     = createHeaderVectorButton(ZaloVectorIcon.Type.SEARCH,      ChatColor.ICON_DEFAULT, "Tìm kiếm tin nhắn", false);
+        JButton toggleInfoBtn = createHeaderVectorButton(ZaloVectorIcon.Type.PANEL_SPLIT, ChatColor.ACCENT,       "Thông tin hội thoại", true);
 
         callBtn.addActionListener(e -> initiateCallFromHeader(false));
         videoBtn.addActionListener(e -> initiateCallFromHeader(true));
@@ -639,7 +881,8 @@ public class ChatUI extends JFrame {
         toggleInfoBtn.addActionListener(e -> {
             boolean vis = !rightInfoPanel.isVisible();
             rightInfoPanel.setVisible(vis);
-            toggleInfoBtn.setBackground(vis ? ChatColor.SIDEBAR_SEL : Color.WHITE);
+            toggleInfoBtn.putClientProperty("activeState", vis);
+            toggleInfoBtn.repaint();
         });
 
         actions.add(callBtn);
@@ -662,20 +905,19 @@ public class ChatUI extends JFrame {
         inputBar.setBackground(ChatColor.BG_PANEL);
         inputBar.setBorder(new MatteBorder(1, 0, 0, 0, ChatColor.DIVIDER));
 
-        JPanel toolRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 16, 8));
+        JPanel toolRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 5));
         toolRow.setBackground(ChatColor.BG_PANEL);
         toolRow.setBorder(new CompoundBorder(
                 new MatteBorder(0, 0, 1, 0, ChatColor.DIVIDER),
                 new EmptyBorder(0, 8, 0, 8)));
 
-        Color toolColor = new Color(0x4A5568);
-        JLabel stickerTool = createToolbarVectorIcon(ZaloVectorIcon.Type.SMILE,  toolColor, "Biểu tượng cảm xúc");
-        JLabel imageTool   = createToolbarVectorIcon(ZaloVectorIcon.Type.IMAGE,  toolColor, "Gửi hình ảnh (PNG, JPG, GIF...)");
-        JLabel attachTool  = createToolbarVectorIcon(ZaloVectorIcon.Type.ATTACH, toolColor, "Đính kèm Tệp");
-        JLabel cardTool    = createToolbarVectorIcon(ZaloVectorIcon.Type.CARD,   toolColor, "Gửi danh thiếp");
-        JLabel captureTool = createToolbarVectorIcon(ZaloVectorIcon.Type.CUT,    toolColor, "Chụp màn hình");
-        JLabel formatTool  = createToolbarVectorIcon(ZaloVectorIcon.Type.FORMAT, toolColor, "Định dạng tin nhắn");
-        JLabel moreTool    = createToolbarVectorIcon(ZaloVectorIcon.Type.MORE,   toolColor, "Tùy chọn khác");
+        JLabel stickerTool = createToolbarVectorIcon(ZaloVectorIcon.Type.SMILE,  ChatColor.ICON_EMOJI,   "Biểu tượng cảm xúc");
+        JLabel imageTool   = createToolbarVectorIcon(ZaloVectorIcon.Type.IMAGE,  ChatColor.ICON_IMAGE,   "Gửi hình ảnh (PNG, JPG, GIF...)");
+        JLabel attachTool  = createToolbarVectorIcon(ZaloVectorIcon.Type.ATTACH, ChatColor.ICON_ATTACH,  "Đính kèm Tệp");
+        JLabel cardTool    = createToolbarVectorIcon(ZaloVectorIcon.Type.CARD,   ChatColor.ICON_CARD,    "Gửi danh thiếp");
+        JLabel captureTool = createToolbarVectorIcon(ZaloVectorIcon.Type.CUT,    ChatColor.ICON_CUT,     "Chụp màn hình");
+        JLabel formatTool  = createToolbarVectorIcon(ZaloVectorIcon.Type.FORMAT, ChatColor.ICON_MSG,     "Định dạng tin nhắn");
+        JLabel moreTool    = createToolbarVectorIcon(ZaloVectorIcon.Type.MORE,   ChatColor.ICON_DEFAULT, "Tùy chọn khác");
 
         stickerTool.addMouseListener(new MouseAdapter() {
             @Override public void mouseClicked(MouseEvent e) { showEmojiPopup(stickerTool); }
@@ -719,16 +961,18 @@ public class ChatUI extends JFrame {
         inputField.setCaretColor(ChatColor.ACCENT);
         inputField.setPreferredSize(new Dimension(0, 32));
 
-        JPanel rightInputActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 2));
+        JPanel rightInputActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
         rightInputActions.setOpaque(false);
 
-        JLabel inlineEmojiBtn = createToolbarVectorIcon(ZaloVectorIcon.Type.SMILE, ChatColor.TEXT_SUB, "Chọn Emoji");
+        JLabel inlineEmojiBtn = createToolbarVectorIcon(ZaloVectorIcon.Type.SMILE, ChatColor.ICON_EMOJI, "Chọn Emoji");
         inlineEmojiBtn.addMouseListener(new MouseAdapter() {
             @Override public void mouseClicked(MouseEvent e) { showEmojiPopup(inlineEmojiBtn); }
         });
 
-        Icon thumbIcon = new ZaloVectorIcon(ZaloVectorIcon.Type.SEND_LIKE, 20, new Color(0xF59E0B));
+        Icon thumbIcon      = new ZaloVectorIcon(ZaloVectorIcon.Type.SEND_LIKE, 20, ChatColor.ICON_EMOJI, false);
+        Icon thumbHoverIcon = new ZaloVectorIcon(ZaloVectorIcon.Type.SEND_LIKE, 20, ChatColor.ICON_EMOJI, true);
         sendOrLikeBtn = new JButton(thumbIcon);
+        sendOrLikeBtn.setRolloverIcon(thumbHoverIcon);
         sendOrLikeBtn.setContentAreaFilled(false);
         sendOrLikeBtn.setBorderPainted(false);
         sendOrLikeBtn.setFocusPainted(false);
@@ -742,12 +986,14 @@ public class ChatUI extends JFrame {
                 boolean hasText = !inputField.getText().trim().isEmpty();
                 if (hasText) {
                     sendOrLikeBtn.setIcon(null);
+                    sendOrLikeBtn.setRolloverIcon(null);
                     sendOrLikeBtn.setText("GỬI");
                     sendOrLikeBtn.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 13));
                     sendOrLikeBtn.setForeground(ChatColor.ACCENT);
                 } else {
                     sendOrLikeBtn.setText("");
                     sendOrLikeBtn.setIcon(thumbIcon);
+                    sendOrLikeBtn.setRolloverIcon(thumbHoverIcon);
                 }
             }
         });
@@ -783,54 +1029,113 @@ public class ChatUI extends JFrame {
         client.startCall(activeConversation, activeLabel, isVideo);
     }
 
-    private JButton createHeaderVectorButton(ZaloVectorIcon.Type type, String tooltip, boolean active) {
-        Color c = active ? ChatColor.ACCENT : ChatColor.TEXT_MAIN;
-        JButton btn = new JButton(new ZaloVectorIcon(type, 18, c));
+    private JButton createHeaderVectorButton(ZaloVectorIcon.Type type, Color iconColor, String tooltip, boolean initialActive) {
+        Icon normalIcon = new ZaloVectorIcon(type, 18, iconColor, false);
+        Icon hoverIcon  = new ZaloVectorIcon(type, 18, iconColor, true);
+
+        JButton btn = new JButton(normalIcon) {
+            @Override protected void paintComponent(Graphics g) {
+                Boolean actProp = (Boolean) getClientProperty("activeState");
+                boolean isAct = (actProp != null) ? actProp : false;
+                boolean isHov = getModel().isRollover();
+                if (isAct || isHov) {
+                    Graphics2D g2 = (Graphics2D) g.create();
+                    g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                    if (isAct) {
+                        g2.setColor(ChatColor.SIDEBAR_SEL);
+                    } else {
+                        g2.setColor(new Color(iconColor.getRed(), iconColor.getGreen(), iconColor.getBlue(), 28));
+                    }
+                    g2.fillRoundRect(0, 0, getWidth(), getHeight(), 8, 8);
+                    g2.dispose();
+                }
+                super.paintComponent(g);
+            }
+        };
+        btn.putClientProperty("activeState", initialActive);
+        btn.setRolloverIcon(hoverIcon);
         btn.setToolTipText(tooltip);
-        btn.setBackground(active ? ChatColor.SIDEBAR_SEL : Color.WHITE);
+        btn.setContentAreaFilled(false);
         btn.setFocusPainted(false);
         btn.setBorderPainted(false);
-        btn.setOpaque(true);
+        btn.setOpaque(false);
         btn.setPreferredSize(new Dimension(34, 32));
         btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         return btn;
     }
 
     private JLabel createToolbarVectorIcon(ZaloVectorIcon.Type type, Color color, String tooltip) {
-        JLabel lbl = new JLabel(new ZaloVectorIcon(type, 20, color));
+        final boolean[] hovered = {false};
+        Icon normalIcon = new ZaloVectorIcon(type, 20, color, false);
+        Icon hoverIcon  = new ZaloVectorIcon(type, 20, color, true);
+
+        JLabel lbl = new JLabel(normalIcon, SwingConstants.CENTER) {
+            @Override protected void paintComponent(Graphics g) {
+                if (hovered[0]) {
+                    Graphics2D g2 = (Graphics2D) g.create();
+                    g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                    g2.setColor(new Color(color.getRed(), color.getGreen(), color.getBlue(), 26));
+                    g2.fillRoundRect(0, 0, getWidth(), getHeight(), 8, 8);
+                    g2.dispose();
+                }
+                super.paintComponent(g);
+            }
+        };
+        lbl.setPreferredSize(new Dimension(32, 32));
         lbl.setToolTipText(tooltip);
         lbl.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        lbl.addMouseListener(new MouseAdapter() {
+            @Override public void mouseEntered(MouseEvent e) {
+                hovered[0] = true;
+                lbl.setIcon(hoverIcon);
+                lbl.repaint();
+            }
+            @Override public void mouseExited(MouseEvent e) {
+                hovered[0] = false;
+                lbl.setIcon(normalIcon);
+                lbl.repaint();
+            }
+        });
         return lbl;
     }
 
     private void showEmojiPopup(Component invoker) {
-        JPopupMenu popup = new JPopupMenu();
-        popup.setBackground(Color.WHITE);
-        JPanel grid = new JPanel(new GridLayout(3, 6, 6, 6));
-        grid.setBackground(Color.WHITE);
-        grid.setBorder(new EmptyBorder(8, 8, 8, 8));
-        String[] emojis = {
-                "😀", "😂", "🥰", "😎", "😭", "😡",
-                "👍", "❤️", "🎉", "🔥", "✅", "🙏",
-                "🤝", "💯", "🌹", "☕", "🚀", "✨"
-        };
-        Font emFont = ChatBubble.pickEmojiCapableFont(18);
-        for (String em : emojis) {
-            JButton b = new JButton(em);
-            b.setFont(emFont);
-            b.setBorderPainted(false);
-            b.setContentAreaFilled(false);
-            b.setFocusPainted(false);
-            b.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-            b.addActionListener(e -> {
-                inputField.setText(inputField.getText() + em);
-                popup.setVisible(false);
-                inputField.requestFocusInWindow();
-            });
-            grid.add(b);
+        if (emojiPickerPopup == null) {
+            emojiPickerPopup = new EmojiPickerPopup(selfUsername, this::insertEmojiAtCaret);
         }
-        popup.add(grid);
-        popup.show(invoker, 0, -145);
+        Dimension pref = emojiPickerPopup.getPreferredSize();
+        int x = 0;
+        if (invoker.isShowing()) {
+            int screenX = invoker.getLocationOnScreen().x;
+            int screenW = Toolkit.getDefaultToolkit().getScreenSize().width;
+            if (screenX + pref.width > screenW - 20) {
+                x = invoker.getWidth() - pref.width;
+            }
+        }
+        int y = -pref.height - 6;
+        emojiPickerPopup.show(invoker, x, y);
+    }
+
+    /**
+     * Chèn chuỗi Unicode Emoji vào đúng vị trí con trỏ (caret) hiện tại trong ô nhập tin nhắn,
+     * giữ nguyên nội dung văn bản đã nhập và cho phép chọn nhiều Emoji liên tiếp.
+     */
+    private void insertEmojiAtCaret(String emoji) {
+        if (emoji == null || emoji.isEmpty() || inputField == null) return;
+        try {
+            int start = inputField.getSelectionStart();
+            int end   = inputField.getSelectionEnd();
+            String current = inputField.getText();
+            int safeStart = Math.max(0, Math.min(start, current.length()));
+            int safeEnd   = Math.max(safeStart, Math.min(end, current.length()));
+
+            String updated = current.substring(0, safeStart) + emoji + current.substring(safeEnd);
+            inputField.setText(updated);
+            int newCaretPos = safeStart + emoji.length();
+            inputField.setCaretPosition(newCaretPos);
+        } catch (Exception ex) {
+            inputField.setText(inputField.getText() + emoji);
+        }
     }
 
     private JPanel buildRightInfoPanel() {
@@ -869,10 +1174,10 @@ public class ChatUI extends JFrame {
 
         JPanel quickActions = new JPanel(new GridLayout(1, 3, 8, 0));
         quickActions.setOpaque(false);
-        quickActions.setMaximumSize(new Dimension(260, 64));
-        quickActions.add(buildCircleActionItem("🔔", "<html><center>Tắt thông<br>báo</center></html>"));
-        quickActions.add(buildCircleActionItem("📌", "<html><center>Ghim hội<br>thoại</center></html>"));
-        quickActions.add(buildCircleActionItem("👥", "<html><center>Tạo nhóm<br>trò chuyện</center></html>"));
+        quickActions.setMaximumSize(new Dimension(260, 68));
+        quickActions.add(buildCircleActionItem(ZaloVectorIcon.Type.BELL,      ChatColor.ICON_EMOJI, "<html><center>Tắt thông<br>báo</center></html>"));
+        quickActions.add(buildCircleActionItem(ZaloVectorIcon.Type.PIN,       ChatColor.ICON_CUT,   "<html><center>Ghim hội<br>thoại</center></html>"));
+        quickActions.add(buildCircleActionItem(ZaloVectorIcon.Type.GROUP_ADD, ChatColor.ICON_GROUP, "<html><center>Tạo nhóm<br>trò chuyện</center></html>"));
 
         profileSec.add(infoAvatar);
         profileSec.add(Box.createVerticalStrut(10));
@@ -887,11 +1192,15 @@ public class ChatUI extends JFrame {
                 new MatteBorder(0, 0, 6, 0, ChatColor.BG_PAGE),
                 new EmptyBorder(12, 16, 12, 16)));
 
-        JLabel reminderRow = new JLabel("Danh sách nhắc hẹn");
+        JLabel reminderRow = new JLabel("Danh sách nhắc hẹn",
+                new ZaloVectorIcon(ZaloVectorIcon.Type.REMINDER, 18, ChatColor.ICON_CUT), SwingConstants.LEFT);
+        reminderRow.setIconTextGap(10);
         reminderRow.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 13));
         reminderRow.setForeground(ChatColor.TEXT_MAIN);
 
-        JLabel commonGroupRow = new JLabel("1 nhóm chung");
+        JLabel commonGroupRow = new JLabel("1 nhóm chung",
+                new ZaloVectorIcon(ZaloVectorIcon.Type.GROUP_ADD, 18, ChatColor.ICON_GROUP), SwingConstants.LEFT);
+        commonGroupRow.setIconTextGap(10);
         commonGroupRow.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 13));
         commonGroupRow.setForeground(ChatColor.TEXT_MAIN);
 
@@ -905,7 +1214,9 @@ public class ChatUI extends JFrame {
                 new MatteBorder(0, 0, 6, 0, ChatColor.BG_PAGE),
                 new EmptyBorder(12, 16, 14, 16)));
 
-        JLabel mediaHeader = new JLabel("Ảnh/Video");
+        JLabel mediaHeader = new JLabel("Ảnh/Video",
+                new ZaloVectorIcon(ZaloVectorIcon.Type.MEDIA_GALLERY, 18, ChatColor.ICON_IMAGE), SwingConstants.LEFT);
+        mediaHeader.setIconTextGap(8);
         mediaHeader.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 14));
         mediaHeader.setForeground(ChatColor.TEXT_MAIN);
 
@@ -928,7 +1239,9 @@ public class ChatUI extends JFrame {
         fileSec.setBackground(Color.WHITE);
         fileSec.setBorder(new EmptyBorder(12, 16, 16, 16));
 
-        JLabel fileHeader = new JLabel("File");
+        JLabel fileHeader = new JLabel("File",
+                new ZaloVectorIcon(ZaloVectorIcon.Type.FILE_FOLDER, 18, ChatColor.ICON_ATTACH), SwingConstants.LEFT);
+        fileHeader.setIconTextGap(8);
         fileHeader.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 14));
         fileHeader.setForeground(ChatColor.TEXT_MAIN);
 
@@ -956,31 +1269,56 @@ public class ChatUI extends JFrame {
         return panel;
     }
 
-    private JPanel buildCircleActionItem(String icon, String htmlText) {
+    private JPanel buildCircleActionItem(ZaloVectorIcon.Type iconType, Color color, String htmlText) {
         JPanel item = new JPanel();
         item.setLayout(new BoxLayout(item, BoxLayout.Y_AXIS));
         item.setOpaque(false);
+        item.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
 
-        JLabel circle = new JLabel(icon, SwingConstants.CENTER) {
+        final boolean[] hovered = {false};
+        Icon normalIcon = new ZaloVectorIcon(iconType, 18, color, false);
+        Icon hoverIcon  = new ZaloVectorIcon(iconType, 18, color, true);
+
+        JLabel circle = new JLabel(normalIcon, SwingConstants.CENTER) {
             @Override protected void paintComponent(Graphics g) {
                 Graphics2D g2 = (Graphics2D) g.create();
                 g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                g2.setColor(new Color(0xF0F2F5));
-                g2.fillOval(0, 0, 32, 32);
+                if (hovered[0]) {
+                    g2.setColor(new Color(color.getRed(), color.getGreen(), color.getBlue(), 38));
+                } else {
+                    g2.setColor(new Color(0xF0F2F5));
+                }
+                g2.fillOval(0, 0, 34, 34);
                 g2.dispose();
                 super.paintComponent(g);
             }
         };
-        circle.setFont(ChatBubble.pickEmojiCapableFont(13));
-        circle.setPreferredSize(new Dimension(32, 32));
-        circle.setMinimumSize(new Dimension(32, 32));
-        circle.setMaximumSize(new Dimension(32, 32));
+        circle.setPreferredSize(new Dimension(34, 34));
+        circle.setMinimumSize(new Dimension(34, 34));
+        circle.setMaximumSize(new Dimension(34, 34));
         circle.setAlignmentX(Component.CENTER_ALIGNMENT);
 
         JLabel txt = new JLabel(htmlText, SwingConstants.CENTER);
         txt.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 11));
         txt.setForeground(ChatColor.TEXT_SUB);
         txt.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+        MouseAdapter hoverAdapter = new MouseAdapter() {
+            @Override public void mouseEntered(MouseEvent e) {
+                hovered[0] = true;
+                circle.setIcon(hoverIcon);
+                txt.setForeground(ChatColor.TEXT_MAIN);
+                circle.repaint();
+            }
+            @Override public void mouseExited(MouseEvent e) {
+                hovered[0] = false;
+                circle.setIcon(normalIcon);
+                txt.setForeground(ChatColor.TEXT_SUB);
+                circle.repaint();
+            }
+        };
+        item.addMouseListener(hoverAdapter);
+        circle.addMouseListener(hoverAdapter);
 
         item.add(circle);
         item.add(Box.createVerticalStrut(4));
@@ -1107,14 +1445,15 @@ public class ChatUI extends JFrame {
         String text = inputField.getText().trim();
         if (text.isEmpty()) return;
 
+        String now = java.time.LocalTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"));
+        appendMessage(activeConversation, selfDisplayName, text, true, now, -1L, "");
+
         if (GROUP_ID.equals(activeConversation)) {
             client.sendMessage(text);
         } else {
             client.sendPrivateMessage(activeConversation, text);
         }
-        String now = java.time.LocalTime.now()
-                .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"));
-        appendMessage(activeConversation, selfDisplayName, text, true, now);
         inputField.setText("");
     }
 
@@ -1170,10 +1509,6 @@ public class ChatUI extends JFrame {
         return true;
     }
 
-    /**
-     * Cập nhật phần xem trước tin nhắn gần nhất (Last Message Preview) cho một cuộc trò chuyện
-     * mà không làm thay đổi nội dung khung chat chính.
-     */
     public void updateConversationPreview(String convId, String senderLabel, String rawContent,
                                           boolean isSelf, String timeLabel) {
         String cleanBody = ChatBubble.formatPreviewContent(rawContent);
@@ -1186,10 +1521,15 @@ public class ChatUI extends JFrame {
     public void appendMessage(String convId, String from, String text, boolean isSelf) {
         String now = java.time.LocalTime.now()
                 .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"));
-        appendMessage(convId, from, text, isSelf, now);
+        appendMessage(convId, from, text, isSelf, now, -1L, "");
     }
 
     public void appendMessage(String convId, String from, String text, boolean isSelf, String sentAt) {
+        appendMessage(convId, from, text, isSelf, sentAt, -1L, "");
+    }
+
+    public void appendMessage(String convId, String from, String text, boolean isSelf,
+                              String sentAt, long messageId, String reactions) {
         String timeLabel = "", dateLabel = "";
         if (sentAt != null && sentAt.contains(" ")) {
             String[] p = sentAt.split(" ", 2);
@@ -1208,7 +1548,16 @@ public class ChatUI extends JFrame {
         }
 
         updateConversationPreview(convId, from, text, isSelf, timeLabel);
-        appendBlock(convId, from, new ChatBubble(text, isSelf, timeLabel), isSelf);
+        ChatBubble bubble = new ChatBubble(
+                text,
+                isSelf,
+                timeLabel,
+                messageId,
+                selfUsername,
+                client::sendReaction,
+                reactions
+        );
+        appendBlock(convId, from, bubble, isSelf, messageId);
     }
 
     public void appendSystem(String convId, String msg) {
@@ -1225,10 +1574,15 @@ public class ChatUI extends JFrame {
     public void appendFileCard(String convId, String sender, String name, long size, File file, boolean isSelf) {
         String now = java.time.LocalTime.now()
                 .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"));
-        appendFileCard(convId, sender, name, size, file, isSelf, now);
+        appendFileCard(convId, sender, name, size, file, isSelf, now, -1L, "");
     }
 
     public void appendFileCard(String convId, String sender, String name, long size, File file, boolean isSelf, String timeLabel) {
+        appendFileCard(convId, sender, name, size, file, isSelf, timeLabel, -1L, "");
+    }
+
+    public void appendFileCard(String convId, String sender, String name, long size, File file,
+                               boolean isSelf, String timeLabel, long messageId, String reactions) {
         String filePreviewBody = ChatBubble.formatFilePreviewLabel(name);
         String prefix = isSelf ? "Bạn: " : (sender + ": ");
         lastMsgPreview.put(convId, prefix + filePreviewBody);
@@ -1241,7 +1595,70 @@ public class ChatUI extends JFrame {
             refreshRightInfoSharedContent();
         }
 
-        appendBlock(convId, sender, new ChatFile(name, size, file, isSelf, timeLabel), isSelf);
+        ChatFile fileCard = new ChatFile(
+                name,
+                size,
+                file,
+                isSelf,
+                timeLabel,
+                messageId,
+                selfUsername,
+                client::sendReaction,
+                reactions
+        );
+        appendBlock(convId, sender, fileCard, isSelf, messageId);
+    }
+
+    /**
+     * Gắn messageId chính thức từ Server trả về (MSG_ACK) vào bong bóng tin nhắn vừa gửi
+     * để người gửi hoặc người nhận có thể thả cảm xúc ngay lập tức.
+     */
+    public void bindPendingSelfMessageId(String convId, long messageId) {
+        if (messageId <= 0) return;
+        Deque<JComponent> queue = pendingSelfMessages.get(convId);
+        if (queue != null && !queue.isEmpty()) {
+            JComponent comp = queue.pollFirst();
+            if (comp instanceof ChatBubble cb) {
+                cb.setMessageId(messageId);
+            } else if (comp instanceof ChatFile cf) {
+                cf.setMessageId(messageId);
+            }
+            messageComponentMap.put(messageId, comp);
+            JPanel row = (JPanel) comp.getClientProperty("messageRow");
+            if (row != null) {
+                messageRowMap.put(messageId, row);
+            }
+        }
+    }
+
+    /**
+     * Cập nhật hiển thị Reaction realtime dưới bong bóng tin nhắn mà không làm nhảy khung chat.
+     */
+    public void updateMessageReactions(String convId, long messageId, String reactionSummary) {
+        JComponent comp = messageComponentMap.get(messageId);
+        if (comp == null) return;
+
+        if (comp instanceof ChatBubble cb) {
+            cb.updateReactions(reactionSummary);
+        } else if (comp instanceof ChatFile cf) {
+            cf.updateReactions(reactionSummary);
+        }
+
+        JPanel messageRow = messageRowMap.get(messageId);
+        if (messageRow != null) {
+            messageRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
+            messageRow.invalidate();
+            Dimension pref = messageRow.getPreferredSize();
+            messageRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, pref.height));
+            messageRow.revalidate();
+            messageRow.repaint();
+
+            Container parent = messageRow.getParent();
+            if (parent != null) {
+                parent.revalidate();
+                parent.repaint();
+            }
+        }
     }
 
     private void appendDateDivider(String convId, String label) {
@@ -1289,6 +1706,10 @@ public class ChatUI extends JFrame {
     }
 
     private void appendBlock(String convId, String sender, JComponent content, boolean isSelf) {
+        appendBlock(convId, sender, content, isSelf, -1L);
+    }
+
+    private void appendBlock(String convId, String sender, JComponent content, boolean isSelf, long messageId) {
         MessageFeedPanel feed = conversationFeeds.computeIfAbsent(convId, k -> new MessageFeedPanel());
 
         String senderKey = isSelf ? "__SELF__" : sender;
@@ -1329,6 +1750,14 @@ public class ChatUI extends JFrame {
             leftWrapper.add(avatarSlot,  BorderLayout.WEST);
             leftWrapper.add(bubbleStack, BorderLayout.CENTER);
             messageRow.add(leftWrapper,  BorderLayout.WEST);
+        }
+
+        content.putClientProperty("messageRow", messageRow);
+        if (messageId > 0) {
+            messageComponentMap.put(messageId, content);
+            messageRowMap.put(messageId, messageRow);
+        } else if (isSelf) {
+            pendingSelfMessages.computeIfAbsent(convId, k -> new ArrayDeque<>()).addLast(content);
         }
 
         Dimension pref = messageRow.getPreferredSize();

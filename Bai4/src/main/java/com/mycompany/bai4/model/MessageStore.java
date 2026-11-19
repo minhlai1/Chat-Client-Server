@@ -4,7 +4,9 @@ import com.mycompany.bai4.util.DatabaseConnection;
 
 import java.sql.*;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 public class MessageStore {
 
@@ -21,9 +23,6 @@ public class MessageStore {
             String reactions
     ) {}
 
-    /**
-     * Lưu tin nhắn nhóm vào DB và trả về messageId vừa tạo.
-     */
     public static long saveGroupMessage(String fromUser, String fromDisplay, String content) {
         String sql = "INSERT INTO messages (type, from_user, from_display, content) VALUES ('group', ?, ?, ?)";
         try (Connection conn = DatabaseConnection.getConnection();
@@ -41,9 +40,6 @@ public class MessageStore {
         return -1L;
     }
 
-    /**
-     * Lưu tin nhắn riêng vào DB và trả về messageId vừa tạo.
-     */
     public static long savePrivateMessage(String fromUser, String fromDisplay, String toUser, String content) {
         String sql = "INSERT INTO messages (type, from_user, from_display, to_user, content) VALUES ('private', ?, ?, ?, ?)";
         try (Connection conn = DatabaseConnection.getConnection();
@@ -62,14 +58,44 @@ public class MessageStore {
         return -1L;
     }
 
+    public static Message findMessageById(long messageId) {
+        String sql = "SELECT id, type, from_user, from_display, to_user, content, sent_at FROM messages WHERE id = ?";
+        try (Connection conn = DatabaseConnection.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, messageId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return new Message(
+                            rs.getLong("id"),
+                            rs.getString("type"),
+                            rs.getString("from_user"),
+                            rs.getString("from_display"),
+                            rs.getString("to_user"),
+                            rs.getString("content"),
+                            rs.getString("sent_at"),
+                            ""
+                    );
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("[MessageStore] Lỗi truy vấn messageId: " + e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Thêm, cập nhật hoặc gỡ phản ứng của một người dùng trên tin nhắn.
+     * Đảm bảo mỗi (message_id, username) chỉ có tối đa 1 phản ứng đang hoạt động.
+     */
     public static synchronized String toggleReaction(long messageId, String username, String emoji) {
+        if (messageId <= 0 || username == null || username.isBlank() || emoji == null || emoji.isBlank()) {
+            return getReactionSummary(messageId);
+        }
         String checkSql  = "SELECT emoji FROM message_reactions WHERE message_id = ? AND username = ?";
         String deleteSql = "DELETE FROM message_reactions WHERE message_id = ? AND username = ?";
-        String upsertSql = """
-                INSERT INTO message_reactions (message_id, username, emoji)
-                VALUES (?, ?, ?)
-                ON DUPLICATE KEY UPDATE emoji = VALUES(emoji)
-                """;
+        String updateSql = "UPDATE message_reactions SET emoji = ? WHERE message_id = ? AND username = ?";
+        String insertSql = "INSERT INTO message_reactions (message_id, username, emoji) VALUES (?, ?, ?)";
+
         try (Connection conn = DatabaseConnection.getConnection()) {
             String existing = null;
             try (PreparedStatement ps = conn.prepareStatement(checkSql)) {
@@ -86,8 +112,15 @@ public class MessageStore {
                     ps.setString(2, username);
                     ps.executeUpdate();
                 }
+            } else if (existing != null) {
+                try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
+                    ps.setString(1, emoji);
+                    ps.setLong(2, messageId);
+                    ps.setString(3, username);
+                    ps.executeUpdate();
+                }
             } else {
-                try (PreparedStatement ps = conn.prepareStatement(upsertSql)) {
+                try (PreparedStatement ps = conn.prepareStatement(insertSql)) {
                     ps.setLong(1, messageId);
                     ps.setString(2, username);
                     ps.setString(3, emoji);
@@ -95,24 +128,56 @@ public class MessageStore {
                 }
             }
         } catch (SQLException e) {
-            System.err.println("[MessageStore] Lỗi cập nhật cảm xúc: " + e.getMessage());
+            System.err.println("[MessageStore] Lỗi cập nhật cảm xúc (msgId=" + messageId + ", user=" + username + "): " + e.getMessage());
         }
         return getReactionSummary(messageId);
     }
 
+    /**
+     * Trả về chuỗi tổng hợp Reaction:
+     * emoji1=count1=userA|DisplayA~userB|DisplayB,emoji2=count2=userC|DisplayC
+     */
     public static String getReactionSummary(long messageId) {
-        String sql = "SELECT emoji, COUNT(*) AS cnt FROM message_reactions WHERE message_id = ? GROUP BY emoji ORDER BY cnt DESC";
-        StringBuilder sb = new StringBuilder();
+        if (messageId <= 0) return "";
+        String sql = """
+                SELECT r.emoji, r.username, COALESCE(u.display_name, r.username) AS display_name
+                FROM message_reactions r
+                LEFT JOIN users u ON r.username COLLATE utf8mb4_unicode_ci = u.username COLLATE utf8mb4_unicode_ci
+                WHERE r.message_id = ?
+                """;
+        Map<String, List<String>> grouped = new LinkedHashMap<>();
         try (Connection conn = DatabaseConnection.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setLong(1, messageId);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    if (sb.length() > 0) sb.append(",");
-                    sb.append(rs.getString("emoji")).append("=").append(rs.getInt("cnt"));
+                    String em   = rs.getString("emoji");
+                    String user = rs.getString("username");
+                    String dn   = rs.getString("display_name");
+                    if (em == null || em.isEmpty()) continue;
+                    String safeDn = (dn == null ? user : dn).replaceAll("[,=~|:]", " ");
+                    grouped.computeIfAbsent(em, k -> new ArrayList<>())
+                            .add(user + "|" + safeDn);
                 }
             }
-        } catch (SQLException ignored) {
+        } catch (SQLException e) {
+            System.err.println("[MessageStore] Lỗi đọc danh sách cảm xúc (msgId=" + messageId + "): " + e.getMessage());
+        }
+
+        if (grouped.isEmpty()) return "";
+
+        var entries = new ArrayList<>(grouped.entrySet());
+        entries.sort((a, b) -> Integer.compare(b.getValue().size(), a.getValue().size()));
+
+        StringBuilder sb = new StringBuilder();
+        for (var entry : entries) {
+            if (sb.length() > 0) sb.append(",");
+            List<String> users = entry.getValue();
+            sb.append(entry.getKey())
+                    .append("=")
+                    .append(users.size())
+                    .append("=")
+                    .append(String.join("~", users));
         }
         return sb.toString();
     }
@@ -159,7 +224,7 @@ public class MessageStore {
                             rs.getString("to_user"),
                             rs.getString("content"),
                             rs.getString("sent_at"),
-                            ""
+                            getReactionSummary(msgId)
                     ));
                 }
             }
@@ -170,10 +235,6 @@ public class MessageStore {
         return result;
     }
 
-    /**
-     * Lấy tin nhắn gần nhất của từng cuộc trò chuyện cá nhân liên quan đến username
-     * để hiển thị chính xác phần xem trước (Last Message Preview) ngay khi mở ứng dụng.
-     */
     public static List<Message> loadLatestPrivateMessagesForUser(String username) {
         String sql = """
                 SELECT m.id, m.type, m.from_user, m.from_display, m.to_user, m.content,
@@ -229,7 +290,7 @@ public class MessageStore {
                             rs.getString("to_user"),
                             rs.getString("content"),
                             rs.getString("sent_at"),
-                            ""
+                            getReactionSummary(msgId)
                     ));
                 }
             }

@@ -13,17 +13,10 @@ public class DatabaseConnection {
     private static final String USER = "root";
     private static final String PASS = "12345";
 
-    /**
-     * Trả về một Connection mới tới MySQL với cấu hình UTF-8 (utf8mb4) đầy đủ.
-     */
     public static Connection getConnection() throws SQLException {
         return DriverManager.getConnection(URL, USER, PASS);
     }
 
-    /**
-     * Tự động tạo bảng users và messages nếu chưa tồn tại, đồng thời đảm bảo
-     * bảng hiện có hỗ trợ đầy đủ utf8mb4 cho Tiếng Việt có dấu và Emoji 4-byte.
-     */
     public static void initSchema() {
         String sqlUsers = """
                 CREATE TABLE IF NOT EXISTS users (
@@ -45,22 +38,47 @@ public class DatabaseConnection {
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
                 """;
 
-        String sqlAlterMessages = """
-                ALTER TABLE messages
-                CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
-                MODIFY content LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
-                MODIFY from_display VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL;
+        String sqlReactions = """
+                CREATE TABLE IF NOT EXISTS message_reactions (
+                    id         BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    message_id BIGINT      NOT NULL,
+                    username   VARCHAR(50) NOT NULL,
+                    emoji      VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                    created_at DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_msg_user (message_id, username),
+                    INDEX idx_reaction_msg (message_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
                 """;
+
+        String[] safeMigrations = {
+                "ALTER TABLE users CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+                "ALTER TABLE messages CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+                "ALTER TABLE messages MODIFY content LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL",
+                "ALTER TABLE messages MODIFY from_display VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL",
+                "ALTER TABLE message_reactions CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+                "ALTER TABLE message_reactions MODIFY emoji VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL",
+                "ALTER TABLE message_reactions ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
+                "ALTER TABLE message_reactions ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+                "ALTER TABLE message_reactions ADD UNIQUE KEY uq_msg_user (message_id, username)",
+                "ALTER TABLE message_reactions ADD INDEX idx_reaction_msg (message_id)"
+        };
 
         try (Connection conn = getConnection();
              Statement  stmt = conn.createStatement()) {
             stmt.execute("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci");
             stmt.execute(sqlUsers);
             stmt.execute(sqlMessages);
-            try {
-                stmt.execute(sqlAlterMessages);
-            } catch (SQLException ignored) {}
-            System.out.println("[DB] Schema khởi tạo thành công (utf8mb4).");
+            stmt.execute(sqlReactions);
+
+            for (String alterSql : safeMigrations) {
+                try {
+                    stmt.execute(alterSql);
+                } catch (SQLException ignored) {
+                    // Cột hoặc index đã tồn tại từ trước -> bỏ qua an toàn
+                }
+            }
+            System.out.println("[DB] Schema khởi tạo thành công (utf8mb4 + message_reactions).");
         } catch (SQLException e) {
             System.err.println("[DB] Lỗi khởi tạo schema: " + e.getMessage());
         }

@@ -181,6 +181,12 @@ public class ChatClient {
         sendLine("PM:" + username + ":" + toUsername + ":" + text);
     }
 
+    public void sendReaction(long messageId, String emoji) {
+        if (messageId > 0 && emoji != null && !emoji.isEmpty()) {
+            sendLine("REACT:" + messageId + ":" + emoji);
+        }
+    }
+
     public void requestPrivateHistory(String withUsername) {
         sendLine("GET_PM_HISTORY:" + withUsername);
     }
@@ -194,10 +200,12 @@ public class ChatClient {
         try {
             byte[] bytes = Files.readAllBytes(file.toPath());
             String b64   = Base64.getEncoder().encodeToString(bytes);
+            try {
+                SwingUtilities.invokeAndWait(() ->
+                        window.appendFileCard(convId, displayName, file.getName(), file.length(), file, true));
+            } catch (Exception ignored) {}
             sendLine("FILE_META:" + username + ":" + toUsername + ":" + file.getName() + ":" + file.length());
             sendLine("FILE_DATA:" + username + ":" + toUsername + ":" + file.getName() + ":" + b64);
-            SwingUtilities.invokeLater(() ->
-                    window.appendFileCard(convId, displayName, file.getName(), file.length(), file, true));
         } catch (IOException ex) {
             SwingUtilities.invokeLater(() ->
                     window.appendSystem(ChatUI.GROUP_ID, "Lỗi gửi tệp: " + ex.getMessage()));
@@ -424,7 +432,22 @@ public class ChatClient {
     }
 
     private void handleIncoming(String line) {
-        if (line.startsWith("MSG:")) {
+        if (line.startsWith("MSG_ID:")) {
+            // MSG_ID:<msgId>:<fromUser>:<fromDN>:<text>
+            String[] p = line.split(":", 5);
+            if (p.length == 5) {
+                long msgId      = parseLongSafe(p[1]);
+                String fromUser = p[2];
+                String fromDN   = p[3];
+                String text     = p[4];
+                boolean isSelf  = fromUser.equals(this.username);
+                String now      = java.time.LocalTime.now()
+                        .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"));
+                SwingUtilities.invokeLater(() ->
+                        window.appendMessage(ChatUI.GROUP_ID, isSelf ? displayName : fromDN, text, isSelf, now, msgId, ""));
+            }
+
+        } else if (line.startsWith("MSG:")) {
             String[] p = line.split(":", 4);
             if (p.length == 4) {
                 String fromUser = p[1];
@@ -435,6 +458,21 @@ public class ChatClient {
                         .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"));
                 SwingUtilities.invokeLater(() ->
                         window.appendMessage(ChatUI.GROUP_ID, isSelf ? displayName : fromDN, text, isSelf, now));
+            }
+
+        } else if (line.startsWith("PM_ID:")) {
+            // PM_ID:<msgId>:<fromUser>:<fromDN>:<text>
+            String[] p = line.split(":", 5);
+            if (p.length == 5) {
+                long msgId      = parseLongSafe(p[1]);
+                String fromUser = p[2];
+                String fromDN   = p[3];
+                String text     = p[4];
+                boolean isSelf  = fromUser.equals(this.username);
+                String now      = java.time.LocalTime.now()
+                        .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"));
+                SwingUtilities.invokeLater(() ->
+                        window.appendMessage(fromUser, fromDN, text, isSelf, now, msgId, ""));
             }
 
         } else if (line.startsWith("PM:")) {
@@ -450,12 +488,32 @@ public class ChatClient {
                         window.appendMessage(fromUser, fromDN, text, isSelf, now));
             }
 
+        } else if (line.startsWith("MSG_ACK:")) {
+            // MSG_ACK:<convKey>:<msgId>
+            String[] p = line.split(":", 3);
+            if (p.length == 3) {
+                String convKey = p[1];
+                long msgId     = parseLongSafe(p[2]);
+                String convId  = "GROUP".equals(convKey) ? ChatUI.GROUP_ID : convKey;
+                SwingUtilities.invokeLater(() -> window.bindPendingSelfMessageId(convId, msgId));
+            }
+
+        } else if (line.startsWith("REACTION_UPDATE:")) {
+            // REACTION_UPDATE:<convKey>:<msgId>:<summary>
+            String[] p = line.split(":", 4);
+            if (p.length >= 3) {
+                String convKey = p[1];
+                long msgId     = parseLongSafe(p[2]);
+                String summary = (p.length == 4) ? p[3] : "";
+                String convId  = "GROUP".equals(convKey) ? ChatUI.GROUP_ID : convKey;
+                SwingUtilities.invokeLater(() -> window.updateMessageReactions(convId, msgId, summary));
+            }
+
         } else if (line.startsWith("SERVER:")) {
             String msg = line.substring(7);
             SwingUtilities.invokeLater(() -> window.appendSystem(ChatUI.GROUP_ID, msg));
 
         } else if (line.startsWith("LAST_PM_PREVIEW:")) {
-            // LAST_PM_PREVIEW:<otherUser>:<fromUser>:<fromDisplay>:<sentAt>:<content>
             String[] p = line.split(":", 6);
             if (p.length == 6) {
                 String otherUser = p[1];
@@ -468,6 +526,34 @@ public class ChatClient {
                 String timeOnly  = sentAt.contains(" ") ? sentAt.split(" ")[0].replace(".", ":") : sentAt;
                 SwingUtilities.invokeLater(() ->
                         window.updateConversationPreview(otherUser, senderLbl, content, isSelf, timeOnly));
+            }
+
+        } else if (line.startsWith("HISTORY_MSG_V2:")) {
+            // HISTORY_MSG_V2:<convKey>:<msgId>:<fromUser>:<fromDN>:<sentAt>:<reactions>:<content>
+            String[] p = line.split(":", 8);
+            if (p.length == 8) {
+                String convKey   = p[1];
+                long msgId       = parseLongSafe(p[2]);
+                String fromUser  = p[3];
+                String fromDN    = p[4];
+                String sentAt    = p[5];
+                String reactions = p[6];
+                String content   = p[7];
+                boolean isSelf   = fromUser.equals(this.username);
+                String convId    = "GROUP".equals(convKey) ? ChatUI.GROUP_ID : convKey;
+                String label     = isSelf ? displayName : fromDN;
+
+                if (content.startsWith("[FILE_DATA]:")) {
+                    String[] fp = content.split(":", 3);
+                    if (fp.length == 3) {
+                        String fileName = fp[1];
+                        String b64      = fp[2];
+                        restoreHistoryFile(convId, label, fileName, b64, isSelf, sentAt, msgId, reactions);
+                    }
+                } else {
+                    SwingUtilities.invokeLater(() ->
+                            window.appendMessage(convId, label, content, isSelf, sentAt, msgId, reactions));
+                }
             }
 
         } else if (line.startsWith("HISTORY_MSG:")) {
@@ -487,7 +573,7 @@ public class ChatClient {
                     if (fp.length == 3) {
                         String fileName = fp[1];
                         String b64      = fp[2];
-                        restoreHistoryFile(convId, label, fileName, b64, isSelf, sentAt);
+                        restoreHistoryFile(convId, label, fileName, b64, isSelf, sentAt, -1L, "");
                     }
                 } else {
                     SwingUtilities.invokeLater(() ->
@@ -513,6 +599,18 @@ public class ChatClient {
             for (String[] pair : pairs) userDisplayMap.put(pair[1], pair[0]);
             SwingUtilities.invokeLater(() -> window.updateUserList(pairs));
 
+        } else if (line.startsWith("FILE_DATA_ID:")) {
+            // FILE_DATA_ID:<msgId>:<fromUser>:<toUser>:<fileName>:<b64>
+            String[] p = line.split(":", 6);
+            if (p.length == 6) {
+                long msgId      = parseLongSafe(p[1]);
+                String fromUser = p[2];
+                String toUser   = p[3];
+                String convId   = "ALL".equalsIgnoreCase(toUser) ? ChatUI.GROUP_ID : fromUser;
+                boolean isSelf  = fromUser.equals(this.username);
+                receiveFile(convId, fromUser, p[4], p[5], isSelf, msgId);
+            }
+
         } else if (line.startsWith("FILE_DATA:")) {
             String[] p = line.split(":", 5);
             if (p.length == 5) {
@@ -520,12 +618,17 @@ public class ChatClient {
                 String toUser   = p[2];
                 String convId   = "ALL".equalsIgnoreCase(toUser) ? ChatUI.GROUP_ID : fromUser;
                 boolean isSelf  = fromUser.equals(this.username);
-                receiveFile(convId, fromUser, p[3], p[4], isSelf);
+                receiveFile(convId, fromUser, p[3], p[4], isSelf, -1L);
             }
 
         } else if (line.startsWith("CALL_")) {
             handleIncomingCallSignal(line);
         }
+    }
+
+    private long parseLongSafe(String s) {
+        try { return Long.parseLong(s.trim()); }
+        catch (NumberFormatException e) { return -1L; }
     }
 
     private synchronized void handleIncomingCallSignal(String line) {
@@ -645,21 +748,24 @@ public class ChatClient {
         }
     }
 
-    private void receiveFile(String convId, String fromUser, String name, String b64, boolean isSelf) {
+    private void receiveFile(String convId, String fromUser, String name, String b64, boolean isSelf, long msgId) {
         try {
             byte[] bytes = Base64.getDecoder().decode(b64);
             File   out   = resolveUniqueFile(downloadDir, name);
             Files.write(out.toPath(), bytes);
             String fromDN = userDisplayMap.getOrDefault(fromUser, fromUser);
+            String now    = java.time.LocalTime.now()
+                    .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"));
             SwingUtilities.invokeLater(() ->
-                    window.appendFileCard(convId, fromDN, out.getName(), out.length(), out, isSelf));
+                    window.appendFileCard(convId, fromDN, out.getName(), out.length(), out, isSelf, now, msgId, ""));
         } catch (IOException ex) {
             SwingUtilities.invokeLater(() ->
                     window.appendSystem(ChatUI.GROUP_ID, "Lỗi lưu tệp: " + ex.getMessage()));
         }
     }
 
-    private void restoreHistoryFile(String convId, String senderLabel, String name, String b64, boolean isSelf, String sentAt) {
+    private void restoreHistoryFile(String convId, String senderLabel, String name, String b64,
+                                    boolean isSelf, String sentAt, long msgId, String reactions) {
         try {
             byte[] bytes = Base64.getDecoder().decode(b64);
             File   out   = new File(downloadDir, name);
@@ -668,7 +774,7 @@ public class ChatClient {
             }
             String timeOnly = sentAt.contains(" ") ? sentAt.split(" ")[0].replace(".", ":") : sentAt;
             SwingUtilities.invokeLater(() ->
-                    window.appendFileCard(convId, senderLabel, out.getName(), out.length(), out, isSelf, timeOnly));
+                    window.appendFileCard(convId, senderLabel, out.getName(), out.length(), out, isSelf, timeOnly, msgId, reactions));
         } catch (Exception ignored) {}
     }
 
